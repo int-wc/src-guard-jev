@@ -1,0 +1,6 @@
+# 核心依赖
+mitmproxy>=10.0
+urllib3>=2.0
+
+# 可选：观测台
+# python3 标准库即可（http.server + SSE），无需额外包

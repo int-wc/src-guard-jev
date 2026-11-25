@@ -1,0 +1,41 @@
+{
+  "_comment": "战役分组配置示例。复制为 scopes.json 并填入你自己的目标域名后缀。",
+  "_howto": "后缀匹配支持子域：配置 customer-c.example 会匹配 sub.customer-c.example",
+  "version": 1,
+  "groups": [
+    {
+      "key": "customer-a",
+      "label": "客户 A",
+      "color": "#e8562a",
+      "suffixes": [
+        "customer-a.example",
+        "customer-a-alt.example"
+      ]
+    },
+    {
+      "key": "customer-b",
+      "label": "客户 B",
+      "color": "#00b4a6",
+      "suffixes": [
+        "customer-b.example"
+      ]
+    },
+    {
+      "key": "customer-c",
+      "label": "客户 C",
+      "color": "#2f6fdb",
+      "suffixes": [
+        "customer-c.example"
+      ]
+    },
+    {
+      "key": "public",
+      "label": "公开测试目标",
+      "color": "#8b5cf6",
+      "suffixes": [
+        "example.com",
+        "example.org"
+      ]
+    }
+  ]
+}

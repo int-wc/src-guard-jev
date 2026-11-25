@@ -1,0 +1,24 @@
+[Unit]
+Description=Jev Outbound Guard (mitmproxy + semantic audit)
+After=network.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=/opt/src-guard-jev
+Environment=JEV_API_KEY=CHANGE_ME
+Environment=JEV_API_URL=https://api.typesafe.ai/v1/systemone
+Environment=JEV_PROXY=http://127.0.0.1:7892
+Environment=GUARD_POLICY=dml
+Environment=GUARD_ENFORCE=1
+Environment=AUDIT_MODE=both
+Environment=GUARD_SCOPE_MODE=all
+ExecStart=/usr/bin/mitmdump -q --listen-host 0.0.0.0 --listen-port 9200 \
+  --set ssl_insecure=true -s /opt/src-guard-jev/core/mitm_guard.py
+Restart=always
+RestartSec=3
+StandardOutput=append:/var/log/jev-guard/mitm.log
+StandardError=append:/var/log/jev-guard/mitm.log
+
+[Install]
+WantedBy=default.target

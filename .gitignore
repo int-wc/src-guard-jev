@@ -1,0 +1,22 @@
+# 运行时产物
+*.log
+*.jsonl
+__pycache__/
+*.py[cod]
+
+# 真实配置（含客户域名/凭据，绝不入库）
+scopes.json
+secrets.*
+.env
+*.key
+*.pem
+
+# 数据目录
+data/
+staging/
+probe_history*
+
+# 编辑器
+.vscode/
+.idea/
+*.swp

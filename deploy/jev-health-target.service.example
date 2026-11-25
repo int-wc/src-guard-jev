@@ -1,0 +1,13 @@
+[Unit]
+Description=Jev Health Probe Target (localhost only)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/src-guard-jev/healthsvc
+ExecStart=/usr/bin/python3 /opt/src-guard-jev/healthsvc/health_server.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
