@@ -10,6 +10,110 @@ spec = importlib.util.spec_from_file_location('gd', os.path.join(_CORE, 'guard.p
 gd = importlib.util.module_from_spec(spec); spec.loader.exec_module(gd)
 LOG = os.environ.get('GUARD_LOG', os.path.join(_CORE, 'mitm-audit.log'))
 
+
+
+# ===== 2026-11-28: read-method destructive-payload enforcement =====
+# READ_METHOD_NEVER_BLOCK lets GET/HEAD/OPTIONS semantic verdicts be recorded
+# without blocking, so recon traffic (paging queries, IDOR reads, SQLi probes)
+# is not falsely blocked. But it also let genuinely destructive payloads pass:
+#     GET /?cmd=rm -rf /              -> allowed (rule layer already saw payload_signal)
+#     GET /?file=/etc/passwd          -> allowed (rule layer already saw audit_sensitive)
+#     GET /?x=bash -i >& /dev/tcp/... -> allowed (rule layer already saw payload_signal)
+#
+# Fix: do NOT block all reads (that would hurt recon). Block a read only when ALL
+# of the following hold:
+#   (a) model says dangerous (jallow == False)
+#   (b) model confidence >= GUARD_READ_BLOCK_MIN_CONF (default 0.80)
+#   (c) rule/semantic layer independently saw a destructive payload signal
+# Three independent signals must agree, which keeps false positives minimal.
+READ_BLOCK_ENFORCE = os.environ.get('GUARD_READ_BLOCK_ENFORCE', '1').strip().lower() \
+    not in ('0', 'false', 'off', 'no')
+READ_BLOCK_MIN_CONF = float(os.environ.get('GUARD_READ_BLOCK_MIN_CONF', '0.80'))
+
+
+def _read_destructive_signal(reasons):
+    """Whether the rule layer independently saw a destructive payload signal.
+
+    Three rule-layer signals qualify for a read-method block:
+      payload_signal   - destructive system command (rm -rf, reverse shell, ...)
+      mutation_signal  - GraphQL/REST mutation that rewrites existing data
+      audit_sensitive  - sensitive/system file read (/etc/passwd, id_rsa, ...)
+    The last one matters because a GET that reads /etc/passwd through a real
+    file-read hole is not mere recon: it exfiltrates credentials and keys.
+    Only system-sensitive paths qualify; ordinary source-file reads are left
+    to the semantic layer so that normal source auditing keeps working.
+    """
+    for r in (reasons or []):
+        t = str(r)
+        if 'payload_signal' in t or 'mutation_signal' in t:
+            return t[:80]
+        if 'audit_sensitive' in t:
+            # only block system-sensitive reads, not ordinary source downloads
+            low = t.lower()
+            sys_markers = ('/etc/passwd', '/etc/shadow', '/etc/hosts', '.ssh/',
+                           'id_rsa', 'id_dsa', 'id_ecdsa', 'id_ed25519',
+                           'web.config', 'wp-config', '.env', '.git/config',
+                           '/proc/self', '/proc/1/', 'boot.ini', 'win.ini')
+            if any(m in low for m in sys_markers):
+                return t[:80]
+    try:
+        import guard_semantic as _gs
+        _sig = _gs.last_destructive_signal()
+        if _sig:
+            return str(_sig[0])[:80]
+    except Exception:
+        pass
+    return None
+
+
+def _has_destructive_payload(reasons):
+    """True when the rule layer reports a deterministic destructive payload signal.
+
+    Such a signal must not be overruled by the semantic layer: if the target really
+    forwards this parameter to a shell or a file reader, letting it through causes
+    real damage. Used to veto the dml weak-evidence override.
+    """
+    return _read_destructive_signal(reasons) is not None
+
+
+def _should_block_read(jallow, rule_reasons, info):
+    """Whether a read request should be blocked. Returns (block, why).
+
+    For GET/HEAD/OPTIONS the semantic verdict alone must never block (that is the
+    whole point of READ_METHOD_NEVER_BLOCK: recon traffic like paging queries,
+    IDOR reads and SQLi probes must not be blocked). But a read request that the
+    RULE layer has deterministically flagged as a destructive payload (rm -rf,
+    /etc/passwd, reverse shell, ...) is a different animal: if the target really
+    has a parameter-to-shell hole, forwarding it causes real damage.
+
+    So the rule-layer signal is the primary judgement here, NOT the model:
+      - rule layer saw a destructive payload signal  -> block
+      - model also said dangerous                    -> block (extra corroboration)
+      - otherwise                                    -> allow
+    We deliberately do not require the model to agree: the DeepSeek fallback
+    returns a binary verdict that we measured to be unstable on GET payloads
+    (the same rm -rf payload was judged BLOCK once and ALLOW the next time),
+    so making it a mandatory gate would make this protection flaky.
+    """
+    if not READ_BLOCK_ENFORCE:
+        return False, 'read-block disabled by env'
+    sig = _read_destructive_signal(rule_reasons)
+    if not sig:
+        return False, 'no destructive signal from rule layer'
+    if jallow:
+        # Model disagrees, but the rule layer has a deterministic destructive
+        # signature. Trust the deterministic layer over an unstable model call.
+        return True, 'rule-layer destructive payload (%s), model allowed' % sig
+    conf_raw = (info or {}).get('conf')
+    if conf_raw is not None:
+        try:
+            conf = float(conf_raw)
+        except Exception:
+            conf = None
+        if conf is not None and conf < READ_BLOCK_MIN_CONF:
+            return True, 'rule-layer destructive payload (%s), model conf=%.2f' % (sig, conf)
+    return True, 'model BLOCK + %s' % sig
+
 # 线程池：语义层调用都在池里跑，事件循环只负责 await，不再被阻塞
 _WORKERS = int(os.environ.get('T14_LLM_WORKERS', '12'))
 _POOL = concurrent.futures.ThreadPoolExecutor(max_workers=_WORKERS, thread_name_prefix='t14sem')
@@ -290,12 +394,16 @@ def _evaluate(method, url, headers, body, host, isllm):
         elif not jallow:
             # READ_METHOD_NEVER_BLOCK：读只读探测，Jev 语义意见只记录不拦截。
             # 纯语义模式下不再豁免 —— 规则层不兜底了，GET 也可能承载删除/利用。
+            # 2026-11-28: reads are NOT unconditionally allowed. Block when the model
+            # is high-confidence dangerous AND the rule layer independently saw a
+            # destructive payload signal (see _should_block_read).
             if (not _jo) and str(method).upper() in ('GET', 'HEAD', 'OPTIONS'):
                 reasons = list(reasons) + ['Jev意见(读方法不拦截):' + '；'.join(
                     [str(x) for x in jreasons])[:80]]
             else:
                 allow = False; reasons = list(reasons) + jreasons
-        elif (not allow) and _dml_mode() and _weak_only(reasons):
+        elif (not allow) and _dml_mode() and _weak_only(reasons) \
+                and not _has_destructive_payload(reasons):
             # 确定性层仅凭「携带 id」或「路径末段动词」推断为修改，而 Jev 判无破坏性影响 →
             # 以语义层结论为准（注入/越权探测/申请权限等业务端点都属于这一类，不该拦）。
             # 2026-11-02：改判加保护 —— Jev 置信度不足或确定性层识别出破坏性载荷时不放开。
@@ -310,6 +418,18 @@ def _evaluate(method, url, headers, body, host, isllm):
     if isllm and not allow:
         allow = True
         reasons = ['LLM出口放行(仅审计不拦截)'] + list(reasons)
+
+    # ===== 2026-11-28: read-method destructive-payload enforcement =====
+    # This must NOT live inside the 'elif not jallow' branch: the model verdict
+    # on GET payloads is unstable in practice (the same rm -rf payload was
+    # judged BLOCK once and ALLOW the next time), so gating on the model would
+    # make the protection flaky. Block whenever the deterministic rule layer
+    # saw a destructive payload signature, regardless of the model opinion.
+    if (not _jo) and str(method).upper() in ('GET', 'HEAD', 'OPTIONS'):
+        _blk, _why = _should_block_read(True, reasons, info)
+        if _blk:
+            allow = False
+            reasons = list(reasons) + ['读方法破坏性载荷拦截(%s)' % _why]
     return allow, reasons, info
 
 
